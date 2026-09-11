@@ -20,7 +20,10 @@ use super::super::{
 use crate::{BatchEvent, BatchRuntime};
 
 pub(super) const SONIQO_PARAKEET_MAX_CHUNK_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 59 / 2;
-pub(super) const SONIQO_DIARIZATION_MAX_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 10 * 60;
+pub(super) const SONIQO_DIARIZATION_WINDOW_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 10 * 60;
+pub(super) const SONIQO_DIARIZATION_WINDOW_OVERLAP_SAMPLES: usize =
+    TARGET_SAMPLE_RATE as usize * 90;
+const SONIQO_DIARIZATION_STITCH_GAP_SECONDS: f64 = 0.25;
 pub(super) const SONIQO_PROGRESS_PLANNED: f64 = 0.05;
 const SONIQO_PROGRESS_RANGE: f64 = 0.90;
 pub(super) const SONIQO_PROGRESS_MAX: f64 = 0.95;
@@ -417,29 +420,7 @@ fn transcribe_soniqo_file(
     );
 
     let transcribed_channel_count = channel_files.len();
-    let channel_sample_counts = channel_files
-        .iter()
-        .map(|channel| channel.sample_count)
-        .collect::<Vec<_>>();
-    let diarization_within_limit =
-        soniqo_diarization_plan_within_limit(&channel_sample_counts, num_speakers);
-    let diarization_num_speakers = if diarization_within_limit {
-        num_speakers
-    } else {
-        None
-    };
-    if !diarization_within_limit {
-        tracing::warn!(
-            anarlog.stt.provider.name = "soniqo",
-            anarlog.stt.model = %model,
-            audio.duration_seconds = channel_sample_counts.iter().copied().max().unwrap_or_default()
-                as f64
-                / TARGET_SAMPLE_RATE as f64,
-            diarization.max_duration_seconds =
-                SONIQO_DIARIZATION_MAX_SAMPLES / TARGET_SAMPLE_RATE as usize,
-            "soniqo_diarization_skipped_for_long_recording"
-        );
-    }
+    let diarization_num_speakers = num_speakers;
     if let Some(progress) = progress {
         progress.emit(soniqo_batch_progress(0, transcribed_channel_count));
     }
@@ -800,47 +781,222 @@ fn diarize_soniqo_channel_file(
     progress: Option<&SoniqoProgressReporter>,
 ) -> std::result::Result<Vec<anlg_transcribe_soniqo::DiarizationSegment>, String> {
     ensure_local_batch_running(progress)?;
-    ensure_soniqo_diarization_within_limit(channel.sample_count)?;
-    let mut reader = hound::WavReader::open(channel.file.path()).map_err(|e| e.to_string())?;
-    let samples = reader
-        .samples::<f32>()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    ensure_local_batch_running(progress)?;
-    let segments = diarize_soniqo_channel(model, channel_index, &samples, speaker_count);
-    ensure_local_batch_running(progress)?;
-    Ok(segments)
-}
 
-pub(super) fn ensure_soniqo_diarization_within_limit(
-    sample_count: usize,
-) -> std::result::Result<(), String> {
-    if sample_count <= SONIQO_DIARIZATION_MAX_SAMPLES {
-        return Ok(());
+    let windows = soniqo_diarization_windows(channel.sample_count);
+    let mut merged: Vec<anlg_transcribe_soniqo::DiarizationSegment> = Vec::new();
+
+    for window in windows {
+        ensure_local_batch_running(progress)?;
+        let samples = read_soniqo_channel_window(channel, window)?;
+        ensure_local_batch_running(progress)?;
+        let segments = diarize_soniqo_channel(model, channel_index, &samples, speaker_count);
+        drop(samples);
+
+        let window_start_seconds = window.start as f64 / TARGET_SAMPLE_RATE as f64;
+        let segments = offset_diarization_segments(segments, window_start_seconds);
+        merge_diarization_window(&mut merged, segments, speaker_count, window_start_seconds);
     }
-    Err(
-        "Soniqo speaker diarization is limited to recordings up to 10 minutes to prevent excessive memory use. Retry without an exact speaker count or use another transcription provider."
-            .to_string(),
-    )
+
+    ensure_local_batch_running(progress)?;
+    Ok(merged)
 }
 
-pub(super) fn soniqo_diarization_plan_within_limit(
-    channel_sample_counts: &[usize],
-    num_speakers: Option<u32>,
-) -> bool {
-    channel_sample_counts
-        .iter()
-        .enumerate()
-        .all(|(channel_index, sample_count)| {
-            match soniqo_diarization_speaker_count(
-                num_speakers,
-                channel_sample_counts.len(),
-                channel_index,
-            ) {
-                Some(_) => *sample_count <= SONIQO_DIARIZATION_MAX_SAMPLES,
-                None => true,
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SoniqoDiarizationWindow {
+    pub(super) start: usize,
+    pub(super) len: usize,
+}
+
+/// Split a channel into overlapping windows the diarizer can hold in memory.
+///
+/// The overlap is what lets consecutive windows be stitched together: speaker
+/// labels are arbitrary per call, so the shared region is the only evidence for
+/// which new label continues which old one.
+pub(super) fn soniqo_diarization_windows(sample_count: usize) -> Vec<SoniqoDiarizationWindow> {
+    if sample_count == 0 {
+        return Vec::new();
+    }
+    if sample_count <= SONIQO_DIARIZATION_WINDOW_SAMPLES {
+        return vec![SoniqoDiarizationWindow {
+            start: 0,
+            len: sample_count,
+        }];
+    }
+
+    let stride = SONIQO_DIARIZATION_WINDOW_SAMPLES - SONIQO_DIARIZATION_WINDOW_OVERLAP_SAMPLES;
+    let mut windows = Vec::new();
+    let mut start = 0usize;
+    loop {
+        let len = SONIQO_DIARIZATION_WINDOW_SAMPLES.min(sample_count - start);
+        windows.push(SoniqoDiarizationWindow { start, len });
+        if start + len >= sample_count {
+            break;
+        }
+        start += stride;
+        // Anything shorter than the overlap is already covered by the window
+        // just pushed, and too short to align labels against on its own.
+        if sample_count - start <= SONIQO_DIARIZATION_WINDOW_OVERLAP_SAMPLES {
+            break;
+        }
+    }
+    windows
+}
+
+fn read_soniqo_channel_window(
+    channel: &ResampledChannelFile,
+    window: SoniqoDiarizationWindow,
+) -> std::result::Result<Vec<f32>, String> {
+    let mut reader = hound::WavReader::open(channel.file.path()).map_err(|e| e.to_string())?;
+    if window.start > 0 {
+        let start = u32::try_from(window.start)
+            .map_err(|_| "diarization window starts beyond the WAV sample index".to_string())?;
+        reader.seek(start).map_err(|e| e.to_string())?;
+    }
+    reader
+        .samples::<f32>()
+        .take(window.len)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+pub(super) fn offset_diarization_segments(
+    segments: Vec<anlg_transcribe_soniqo::DiarizationSegment>,
+    offset_seconds: f64,
+) -> Vec<anlg_transcribe_soniqo::DiarizationSegment> {
+    segments
+        .into_iter()
+        .map(|mut segment| {
+            segment.start_seconds += offset_seconds;
+            segment.end_seconds += offset_seconds;
+            segment
         })
+        .collect()
+}
+
+/// Append one window's segments to the running transcript, relabelled to match
+/// the speakers already established.
+pub(super) fn merge_diarization_window(
+    merged: &mut Vec<anlg_transcribe_soniqo::DiarizationSegment>,
+    window_segments: Vec<anlg_transcribe_soniqo::DiarizationSegment>,
+    speaker_count: usize,
+    window_start_seconds: f64,
+) {
+    if merged.is_empty() {
+        for segment in window_segments {
+            push_or_extend_diarization(merged, segment);
+        }
+        return;
+    }
+
+    let mapping = align_diarization_speakers(
+        merged,
+        &window_segments,
+        speaker_count,
+        window_start_seconds,
+    );
+    let boundary = merged
+        .last()
+        .map(|segment| segment.end_seconds)
+        .unwrap_or(window_start_seconds);
+
+    for mut segment in window_segments {
+        if let Some(Some(mapped)) = mapping.get(segment.speaker_index) {
+            segment.speaker_index = *mapped;
+        }
+        if segment.end_seconds <= boundary {
+            continue;
+        }
+        segment.start_seconds = segment.start_seconds.max(boundary);
+        if segment.end_seconds <= segment.start_seconds {
+            continue;
+        }
+        push_or_extend_diarization(merged, segment);
+    }
+}
+
+/// Map this window's speaker labels onto the previous window's by how much time
+/// each pair shares in the overlap region, greedily best-first.
+pub(super) fn align_diarization_speakers(
+    merged: &[anlg_transcribe_soniqo::DiarizationSegment],
+    window_segments: &[anlg_transcribe_soniqo::DiarizationSegment],
+    speaker_count: usize,
+    overlap_start: f64,
+) -> Vec<Option<usize>> {
+    let overlap_end = merged
+        .last()
+        .map(|segment| segment.end_seconds)
+        .unwrap_or(overlap_start);
+
+    let mut agreement = vec![vec![0.0f64; speaker_count]; speaker_count];
+    for new in window_segments {
+        if new.speaker_index >= speaker_count {
+            continue;
+        }
+        for old in merged {
+            if old.speaker_index >= speaker_count {
+                continue;
+            }
+            let start = new.start_seconds.max(old.start_seconds).max(overlap_start);
+            let end = new.end_seconds.min(old.end_seconds).min(overlap_end);
+            if end > start {
+                agreement[new.speaker_index][old.speaker_index] += end - start;
+            }
+        }
+    }
+
+    let mut mapping = vec![None; speaker_count];
+    let mut taken = vec![false; speaker_count];
+    loop {
+        let mut best: Option<(usize, usize, f64)> = None;
+        for new_index in 0..speaker_count {
+            if mapping[new_index].is_some() {
+                continue;
+            }
+            for old_index in 0..speaker_count {
+                if taken[old_index] {
+                    continue;
+                }
+                let score = agreement[new_index][old_index];
+                if score > 0.0 && best.map_or(true, |(_, _, current)| score > current) {
+                    best = Some((new_index, old_index, score));
+                }
+            }
+        }
+        match best {
+            Some((new_index, old_index, _)) => {
+                mapping[new_index] = Some(old_index);
+                taken[old_index] = true;
+            }
+            None => break,
+        }
+    }
+
+    // A speaker silent through the whole overlap has no evidence to match on.
+    // Give it whatever label is left so the output still uses 0..speaker_count.
+    for new_index in 0..speaker_count {
+        if mapping[new_index].is_none()
+            && let Some(free) = (0..speaker_count).find(|old_index| !taken[*old_index])
+        {
+            mapping[new_index] = Some(free);
+            taken[free] = true;
+        }
+    }
+
+    mapping
+}
+
+fn push_or_extend_diarization(
+    merged: &mut Vec<anlg_transcribe_soniqo::DiarizationSegment>,
+    segment: anlg_transcribe_soniqo::DiarizationSegment,
+) {
+    if let Some(last) = merged.last_mut()
+        && last.speaker_index == segment.speaker_index
+        && segment.start_seconds - last.end_seconds <= SONIQO_DIARIZATION_STITCH_GAP_SECONDS
+    {
+        last.end_seconds = last.end_seconds.max(segment.end_seconds);
+        return;
+    }
+    merged.push(segment);
 }
 
 fn diarize_soniqo_channel(

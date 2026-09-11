@@ -690,32 +690,125 @@ fn channel_spooling_stops_cooperatively_when_cancelled() {
     assert!(cancellation_checks.get() >= 2);
 }
 
+fn diarization_segment(
+    start_seconds: f64,
+    end_seconds: f64,
+    speaker_index: usize,
+) -> anlg_transcribe_soniqo::DiarizationSegment {
+    anlg_transcribe_soniqo::DiarizationSegment {
+        start_seconds,
+        end_seconds,
+        speaker_index,
+    }
+}
+
 #[test]
-fn long_exact_speaker_diarization_is_omitted_from_the_plan() {
-    assert!(ensure_soniqo_diarization_within_limit(SONIQO_DIARIZATION_MAX_SAMPLES).is_ok());
-    let error =
-        ensure_soniqo_diarization_within_limit(SONIQO_DIARIZATION_MAX_SAMPLES + 1).unwrap_err();
+fn short_recordings_diarize_in_a_single_window() {
+    assert!(soniqo_diarization_windows(0).is_empty());
 
-    assert!(error.contains("10 minutes"));
-    assert!(error.contains("without an exact speaker count"));
+    let windows = soniqo_diarization_windows(SONIQO_DIARIZATION_WINDOW_SAMPLES);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].start, 0);
+    assert_eq!(windows[0].len, SONIQO_DIARIZATION_WINDOW_SAMPLES);
+}
 
-    let maximum_channel = [SONIQO_DIARIZATION_MAX_SAMPLES];
-    assert!(soniqo_diarization_plan_within_limit(
-        &maximum_channel,
-        Some(2)
-    ));
-    let long_channel = [SONIQO_DIARIZATION_MAX_SAMPLES + 1];
-    assert!(soniqo_diarization_plan_within_limit(&long_channel, None));
-    assert!(!soniqo_diarization_plan_within_limit(
-        &long_channel,
-        Some(2)
-    ));
-    let long_stereo = [
-        SONIQO_DIARIZATION_MAX_SAMPLES + 1,
-        SONIQO_DIARIZATION_MAX_SAMPLES + 1,
+#[test]
+fn long_recordings_split_into_overlapping_windows_that_cover_the_audio() {
+    let stride = SONIQO_DIARIZATION_WINDOW_SAMPLES - SONIQO_DIARIZATION_WINDOW_OVERLAP_SAMPLES;
+    let sample_count = SONIQO_DIARIZATION_WINDOW_SAMPLES * 6 + stride / 2;
+    let windows = soniqo_diarization_windows(sample_count);
+
+    assert!(windows.len() > 1);
+    assert_eq!(windows[0].start, 0);
+
+    for window in &windows {
+        assert!(window.len <= SONIQO_DIARIZATION_WINDOW_SAMPLES);
+        assert!(window.start + window.len <= sample_count);
+    }
+
+    // Consecutive windows must overlap, or there is nothing to align labels on.
+    for pair in windows.windows(2) {
+        let (previous, next) = (pair[0], pair[1]);
+        assert!(next.start > previous.start);
+        assert!(next.start < previous.start + previous.len);
+    }
+
+    let last = windows.last().expect("at least one window");
+    assert_eq!(last.start + last.len, sample_count);
+}
+
+#[test]
+fn window_labels_are_aligned_to_the_speakers_already_established() {
+    // Established: speaker 0 then speaker 1. The next window rediscovers the
+    // same two people but happens to number them the other way around.
+    let merged = vec![
+        diarization_segment(0.0, 30.0, 0),
+        diarization_segment(30.0, 60.0, 1),
     ];
-    assert!(soniqo_diarization_plan_within_limit(&long_stereo, Some(2)));
-    assert!(!soniqo_diarization_plan_within_limit(&long_stereo, Some(3)));
+    let window = vec![
+        diarization_segment(30.0, 60.0, 1),
+        diarization_segment(60.0, 90.0, 0),
+    ];
+
+    let mapping = align_diarization_speakers(&merged, &window, 2, 30.0);
+    assert_eq!(mapping[1], Some(1));
+    assert_eq!(mapping[0], Some(0));
+}
+
+#[test]
+fn merging_a_window_relabels_and_clips_to_the_boundary() {
+    let mut merged = vec![
+        diarization_segment(0.0, 30.0, 0),
+        diarization_segment(30.0, 60.0, 1),
+    ];
+    // The window renumbers the same two people: its speaker 0 is the one the
+    // running transcript already calls speaker 1, and then the other person
+    // takes over again after the boundary.
+    let window = vec![
+        diarization_segment(30.0, 60.0, 0),
+        diarization_segment(60.0, 90.0, 1),
+    ];
+
+    merge_diarization_window(&mut merged, window, 2, 30.0);
+
+    assert_eq!(merged.len(), 3);
+    // The overlap is evidence, not output: the window's copy of 30-60 is
+    // dropped rather than emitted a second time.
+    assert_eq!(merged[0], diarization_segment(0.0, 30.0, 0));
+    assert_eq!(merged[1], diarization_segment(30.0, 60.0, 1));
+    // The tail carries the window's own label 1, which the overlap leaves as
+    // the speaker the transcript already calls 0.
+    assert_eq!(merged[2], diarization_segment(60.0, 90.0, 0));
+}
+
+#[test]
+fn a_speaker_continuing_across_the_boundary_extends_one_segment() {
+    let mut merged = vec![
+        diarization_segment(0.0, 30.0, 0),
+        diarization_segment(30.0, 60.0, 1),
+    ];
+    // One person holds the floor from 30 through 90, split across the windows.
+    let window = vec![
+        diarization_segment(30.0, 60.0, 0),
+        diarization_segment(60.0, 90.0, 0),
+    ];
+
+    merge_diarization_window(&mut merged, window, 2, 30.0);
+
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0], diarization_segment(0.0, 30.0, 0));
+    // Extended in place instead of starting a new segment at the seam.
+    assert_eq!(merged[1], diarization_segment(30.0, 90.0, 1));
+}
+
+#[test]
+fn window_segments_are_shifted_into_recording_time() {
+    let shifted = offset_diarization_segments(vec![diarization_segment(0.0, 12.0, 1)], 600.0);
+
+    assert_eq!(shifted.len(), 1);
+    assert_eq!(shifted[0].start_seconds, 600.0);
+    assert_eq!(shifted[0].end_seconds, 612.0);
+    assert_eq!(shifted[0].speaker_index, 1);
 }
 
 #[test]

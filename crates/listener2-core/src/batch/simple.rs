@@ -20,11 +20,12 @@ use direct::{
 #[cfg(test)]
 use local::{
     FixedSoniqoFileChunkIterator, LOCAL_BATCH_CANCELLED, MAX_LOCAL_BATCH_CHANNELS,
-    SONIQO_DIARIZATION_MAX_SAMPLES, SONIQO_DIRECT_MIC_MIN_RMS, SONIQO_PARAKEET_MAX_CHUNK_SAMPLES,
-    SONIQO_PROGRESS_MAX, SONIQO_PROGRESS_PLANNED, SoniqoChunkStrategy, audio_rms,
-    collect_soniqo_channel_transcripts, ensure_soniqo_diarization_within_limit,
+    SONIQO_DIARIZATION_WINDOW_OVERLAP_SAMPLES, SONIQO_DIARIZATION_WINDOW_SAMPLES,
+    SONIQO_DIRECT_MIC_MIN_RMS, SONIQO_PARAKEET_MAX_CHUNK_SAMPLES, SONIQO_PROGRESS_MAX,
+    SONIQO_PROGRESS_PLANNED, SoniqoChunkStrategy, align_diarization_speakers, audio_rms,
+    collect_soniqo_channel_transcripts, merge_diarization_window, offset_diarization_segments,
     resample_audio_to_channel_files, soniqo_batch_progress, soniqo_chunk_strategy,
-    soniqo_diarization_plan_within_limit, soniqo_diarization_speaker_count, soniqo_language_hint,
+    soniqo_diarization_speaker_count, soniqo_diarization_windows, soniqo_language_hint,
 };
 
 #[cfg(test)]
