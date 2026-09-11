@@ -58,18 +58,16 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::new(PLUGIN_NAME)
         .invoke_handler(specta_builder.invoke_handler())
         .setup(|app, _api| {
+            // Optional in every profile, not just debug: builds made outside
+            // the upstream release pipeline have no PostHog project to report
+            // to, and should stay silent rather than fail to compile. The
+            // format check still applies whenever a key is supplied.
             let posthog_key = {
-                #[cfg(not(debug_assertions))]
-                {
-                    let v = env!("POSTHOG_API_KEY");
-                    assert!(v.starts_with("phc_"));
-                    Some(v)
+                let key = option_env!("POSTHOG_API_KEY");
+                if let Some(value) = key {
+                    assert!(value.starts_with("phc_"));
                 }
-
-                #[cfg(debug_assertions)]
-                {
-                    option_env!("POSTHOG_API_KEY")
-                }
+                key
             };
 
             let client = {

@@ -19,6 +19,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Release builds read these at compile time. POSTHOG_API_KEY is deliberately
+# absent: without it the analytics plugin reports nothing, which is what an
+# internal build should do.
+env:
+  APP_VERSION: 0.0.0-team.${{ github.run_number }}
+  VITE_API_URL: https://api.anarlog.so
+
 jobs:
   macos:
     runs-on: macos-26
