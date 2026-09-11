@@ -1,0 +1,128 @@
+# Unsigned macOS and Windows builds for internal distribution.
+#
+# Deliberately carries no secrets, so it runs on a fork as-is. The cost of that
+# is that nothing it produces is signed: macOS quarantines the app on download
+# and Windows SmartScreen warns before the installer runs. See the job summary
+# for what a recipient has to do.
+#
+# Builds the "Anarlog Dev" identity (com.hyprnote.dev) from the default Tauri
+# config, so it installs alongside an official Anarlog rather than replacing it.
+name: Team build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-26
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: ./.github/actions/pnpm_install
+      - uses: denoland/setup-deno@v2
+      - uses: ./.github/actions/install_desktop_deps
+        with:
+          target: macos
+      - uses: ./.github/actions/rust_install
+        with:
+          platform: macos
+      - run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> $GITHUB_ENV
+      - run: pnpm -F ui build
+      - run: pnpm -F desktop tauri:build
+      - name: Zip the app bundle
+        run: |
+          app=$(find . -path '*/release/bundle/macos/*.app' -maxdepth 6 -print -quit)
+          if [[ -z "$app" ]]; then
+            echo "no .app produced" >&2
+            exit 1
+          fi
+          ditto -c -k --keepParent "$app" anarlog-dev-macos-aarch64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anarlog-dev-macos-aarch64-${{ github.sha }}
+          path: |
+            anarlog-dev-macos-aarch64.zip
+            **/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: ./.github/actions/pnpm_install
+      - uses: denoland/setup-deno@v2
+      - uses: ./.github/actions/install_desktop_deps
+        with:
+          target: windows
+      - uses: ./.github/actions/rust_install
+        with:
+          platform: windows
+      - run: pnpm -F ui build
+      - run: pnpm -F desktop tauri:build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anarlog-dev-windows-x86_64-${{ github.sha }}
+          path: |
+            **/release/bundle/nsis/*.exe
+            **/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+  install_notes:
+    runs-on: ubuntu-latest
+    needs: [macos, windows]
+    if: always()
+    steps:
+      - name: Write install instructions to the run summary
+        run: |
+          {
+            echo "## Installing this build"
+            echo
+            echo "Both builds are unsigned. That is expected and is not a sign"
+            echo "the download is broken."
+            echo
+            echo "### macOS"
+            echo
+            echo 'Unzip, move `Anarlog Dev.app` to /Applications, then run:'
+            echo
+            echo '```'
+            echo 'xattr -dr com.apple.quarantine "/Applications/Anarlog Dev.app"'
+            echo '```'
+            echo
+            echo "Apple Silicon only. Intel Macs are not supported by the local"
+            echo "transcription engine."
+            echo
+            echo "### Windows"
+            echo
+            echo 'Run the installer. At "Windows protected your PC", choose'
+            echo '"More info" then "Run anyway".'
+            echo
+            echo "Local speaker diarization does not run on Windows: the engine"
+            echo "behind it is macOS-only, so that code path returns"
+            echo "UnsupportedPlatform there."
+            echo
+            echo "### Both"
+            echo
+            echo 'Installs as "Anarlog Dev", separate from an official Anarlog.'
+            echo "It starts with an empty library and will not see meetings"
+            echo "captured by the official app."
+          } >> "$GITHUB_STEP_SUMMARY"
